@@ -9,7 +9,7 @@ import os
 import random
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -27,6 +27,21 @@ def run_git(args: List[str], cwd: Path, env: Optional[dict] = None) -> subproces
 
 def is_git_repo(cwd: Path) -> bool:
     return (cwd / ".git").is_dir()
+
+
+def count_commits_on_date(cwd: Path, d: date) -> int:
+    """Return the number of commits that already exist on the given calendar day."""
+    day_start = f"{d} 00:00:00"
+    next_day = d + timedelta(days=1)
+    day_end = f"{next_day} 00:00:00"
+    result = run_git(
+        ["log", "--since", day_start, "--until", day_end, "--format=%H"],
+        cwd=cwd,
+    )
+    if result.returncode != 0:
+        return 0
+    out = result.stdout.strip()
+    return len(out.splitlines()) if out else 0
 
 
 def init_repo(cwd: Path) -> None:
@@ -73,7 +88,7 @@ def make_commit(cwd: Path, commit_time: datetime, message: str, data_path: Path,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Backfill git history with N commits per day from start year to today."
+        description="Backfill git history so each day has at least N commits from start year to today."
     )
     parser.add_argument(
         "--start-year",
@@ -85,7 +100,7 @@ def main() -> int:
         "--commits-per-day",
         type=int,
         default=30,
-        help="Number of commits per day (default: 30)",
+        help="Minimum number of commits per day; only adds enough to reach this (default: 30)",
     )
     parser.add_argument(
         "--dry-run",
@@ -133,7 +148,6 @@ def main() -> int:
     total_days = (today - start_date).days + 1
     if args.max_days is not None:
         total_days = min(total_days, args.max_days)
-    total_commits = total_days * args.commits_per_day
 
     messages = [
         "Update config",
@@ -149,7 +163,17 @@ def main() -> int:
     ]
     random.seed(args.seed)
 
-    print(f"Planned: {total_days} days, {total_commits} commits ({args.commits_per_day}/day)")
+    # Count existing commits per day (after init so initial commit is included)
+    existing_per_day = {}
+    for day_offset in range(total_days):
+        base = start_date + timedelta(days=day_offset)
+        existing_per_day[base] = count_commits_on_date(cwd, base) if is_git_repo(cwd) else 0
+
+    total_to_add = sum(
+        max(0, args.commits_per_day - existing_per_day[d])
+        for d in (start_date + timedelta(days=i) for i in range(total_days))
+    )
+    print(f"Planned: {total_days} days, up to {total_to_add} commits to add (min {args.commits_per_day}/day)")
     if args.dry_run:
         print("Dry run — no git commands will be run.")
         return 0
@@ -158,15 +182,20 @@ def main() -> int:
     commit_count = 0
     for day_offset in range(total_days):
         base = start_date + timedelta(days=day_offset)
+        existing = existing_per_day[base]
+        to_add = max(0, args.commits_per_day - existing)
+        if to_add == 0:
+            day_count += 1
+            continue
         base_dt = datetime.combine(base, datetime.min.time())
-        times = commits_for_day(base_dt, args.commits_per_day)
+        times = commits_for_day(base_dt, to_add)
         for i, t in enumerate(times):
             msg = random.choice(messages) + f" ({t.strftime('%Y-%m-%d %H:%M')})"
             make_commit(cwd, t, msg, data_path, commit_count + 1)
             commit_count += 1
         day_count += 1
         if day_count % 100 == 0:
-            print(f"  {day_count} days, {commit_count} commits...")
+            print(f"  {day_count} days, {commit_count} commits added...")
 
     print(f"Done. {day_count} days, {commit_count} commits.")
     return 0
